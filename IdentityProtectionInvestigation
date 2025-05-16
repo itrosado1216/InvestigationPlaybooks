@@ -1,0 +1,197 @@
+
+
+
+#Model Instructions
+#Use the MCP Tool: run_sentinel_query
+
+//You are doing incident response invesitigation for Identity Protection.
+//Your objective is to run 'Identity Protection - Playbook 1' and based on the results of that query,
+//you will leverage 'Identity Protection - Playbook 2' to cross reference and understand what's their //normal signin patterns. If the device is managed, is less //likely to be a compromised device. After //yoour analysis, you will provide a report of whether if the //user is likely compromised, whether the //risk is likely a false positive, or whether the user //requires more investigation.
+//You will not stop during the workflow, proceed without being prompted to runt all workbooks.
+//Identity Protection - Playbook 2 is ran for EACH user. And the output should be a summary 'PER' user //to aid in incident investigation. You will use 'Identity Protection - Playbook 3' to determine if any //of the US based users have been granted overseas travel access. 
+
+//Context
+//Mac OS Machines: Not Managed
+//Windows Machines: Managed
+
+//Order of Operations
+//Identity Protection - Playbook 1
+// Pass data from Identity Protection - Playbook 1 >> Identity Protection - Playbook 2 >> Identity Protection - Playbook 3 >> Identity Protection - Playbook 4
+// Based on the results of 'Identity Protection - Playbook 3', you will leverage 'Identity Protection //- Playbook 4' to do one additional search to see if any of the users' signing in from outside of the //US have been granted travel access.
+//You will do this for ALL of the users queried from 'Identity Protection - Playbook 1' and by no means will you stop, or only do a subset of users.
+//Run all playbooks without stopping and provide a result at the end of ALL of the users. 
+
+-----------------------Identity Protection - Playbook 1----------------------
+
+AADRiskyUsers
+| where RiskState == "atRisk"
+| where RiskLevel == "medium"
+| project TimeGenerated, UserDisplayName, UserPrincipalName, RiskDetail, RiskLevel, RiskState, CorrelationId
+
+-----------------------Identity Protection - Playbook 2----------------------
+AADUserRiskEvents
+| where TimeGenerated > ago(7d)
+| where RiskLevel == "medim"
+| where RiskState == "atRisk"
+| join kind=inner (
+    SigninLogs
+    | where TimeGenerated > ago(30d)
+    | project 
+        TimeGenerated,
+        UserPrincipalName,
+        AppDisplayName,
+        Location,
+        DeviceDetail,
+        RiskLevel,
+        RiskState,
+        RiskDetail,
+        AppliedConditionalAccessPolicies,
+        AuthenticationDetails,
+        AuthenticationMethodsUsed,
+        AuthenticationRequirement,
+        ClientAppUsed,
+        ConditionalAccessStatus,
+        CorrelationId,
+        ResourceDisplayName,
+        ResourceId,
+        Status,
+        UserAgent
+) on UserPrincipalName
+| summarize 
+    LatestSignIn = arg_max(TimeGenerated, *),
+    SignInCount = count(),
+    UniqueIPs = dcount(tostring(Location.ipAddress)),
+    UniqueApps = dcount(AppDisplayName),
+    UniqueDevices = dcount(tostring(DeviceDetail.deviceId))
+    by UserPrincipalName
+| extend 
+    Browser = tostring(DeviceDetail.browser),
+    DeviceID = tostring(DeviceDetail.deviceId),
+    DeviceDisplayName = tostring(DeviceDetail.displayName),
+    DeviceIsManaged = tostring(DeviceDetail.isManaged),
+    OperatingSystem = tostring(DeviceDetail.operatingSystem),
+    DeviceTrustType = tostring(DeviceDetail.trustType)
+| extend AdditionalInfoDynamic = parse_json(AdditionalInfo)
+| mv-expand AdditionalInfoDynamic 
+| extend Key = tostring(AdditionalInfoDynamic.Key), 
+         Value = AdditionalInfoDynamic.Value
+| where isnotempty(Value)
+| project 
+    LatestSignIn,
+    UserPrincipalName,
+    SignInCount,
+    UniqueIPs,
+    UniqueApps,
+    UniqueDevices,
+    AppDisplayName,
+    Location.ipAddress, 
+    RiskLevel, 
+    RiskState,
+    RiskDetail,
+    DeviceDisplayName, 
+    Browser,
+    DeviceID,
+    DeviceIsManaged,
+    OperatingSystem,
+    DeviceTrustType,
+    AuthenticationMethodsUsed,
+    ConditionalAccessStatus,
+    ClientAppUsed,
+    Key,
+    Value
+
+-----------------------Identity Protection - Playbook 3----------------------
+
+let RiskyUser = '<UserPrincipalName>';
+SigninLogs
+| where TimeGenerated > ago(90d)
+| where UserPrincipalName in (RiskyUser)
+| where ResultType == "0"
+| extend Browser = tostring(DeviceDetail.browser)
+| extend DeviceID = tostring(DeviceDetail.deviceId)
+| extend DisplayName = tostring(DeviceDetail.displayName)
+| extend IsCompliant = tostring(DeviceDetail.isCompliant)
+| extend IsManaged = tostring(DeviceDetail.isManaged)
+| extend OperatingSystem = tostring(DeviceDetail.operatingSystem)
+| extend TrustType = tostring(DeviceDetail.trustType)
+| extend City = tostring(LocationDetails.city)
+| extend Country = tostring(LocationDetails.countryOrRegion)
+| extend State = tostring(LocationDetails.state)
+| summarize arg_max(TimeGenerated, *) by IPAddress
+| project TimeGenerated, UserDisplayName, UserPrincipalName, Browser, DeviceName = DisplayName, IsCompliant, IsManaged, OperatingSystem, TrustType, City, Country, State
+
+-----------------------Identity Protection - Playbook 4----------------------
+//This playbook contains the activity when one of the US based users has been granted overseas access.
+//This activity is done by Engineers leveraing Entra ID Identity Governance Entitlement Packages.
+//Service Desk Engineers submit a time frame for when the user needs overseas access, and when the //assignment time comes, they get assigned to the group, and then removed. The point is that with this //data, we can help with incident investistigation in case the user is being considered risky due to //signing in from a new location. 
+
+AuditLogs
+| where TimeGenerated > ago(90d)
+| search "GovPkg_Foreign Travel CAP"
+| extend userPrincipalName_ = tostring(TargetResources[0].userPrincipalName)
+| extend TravelAccessGroup = tostring(parse_json(tostring(parse_json(tostring(TargetResources[0].modifiedProperties))[1].newValue)))
+| where isnotempty( userPrincipalName_ )
+| project TimeGenerated, userPrincipalName_, OperationName, ActivityDisplayName, TravelAccessGroup
+| sort by TimeGenerated
+
+-----------------------Format Instructions----------------------
+
+<#
+Instructions Format
+
+---Risky User 1---
+
+RiskEventTime: <RiskTimeGenerated>
+DisplayName:<UserDisplayName>
+UserPrincipalName: <UserPrincipalName>
+RiskResult: <'False Positive','Likely False Positive','Inconclusive','Likely Compromised','Compromised'>
+
+ResultCertainty: '% of certainty of result based on queried data'
+
+Investigation Summary:
+//Provide analysis based on
+1) Identity Protection - Playbook 1 + 2
+2) Identity Protection - Playbook 3
+3) Identity Protection - Playbook 4
+
+Investigation Conclusion: <'Analysis conclusion and what it likely means based on activity/signing logs'>
+
+---Risky User 2---
+
+
+RiskEventTime: <RiskTimeGenerated>
+DisplayName:<UserDisplayName>
+UserPrincipalName: <UserPrincipalName>
+RiskResult: <'False Positive','Likely False Positive','Inconclusive','Likely Compromised','Compromised'>
+
+ResultCertainty: '% of certainty of result based on queried data'
+
+Investigation Summary:
+//Provide analysis based on
+1) Identity Protection - Playbook 1 + 2
+2) Identity Protection - Playbook 3
+3) Identity Protection - Playbook 4
+
+Investigation Conclusion: <'Analysis conclusion and what it likely means based on activity/signing logs'>
+
+---Risky User 3---
+
+
+RiskEventTime: <RiskTimeGenerated>
+DisplayName:<UserDisplayName>
+UserPrincipalName: <UserPrincipalName>
+RiskResult: <'False Positive','Likely False Positive','Inconclusive','Likely Compromised','Compromised'>
+
+ResultCertainty: '% of certainty of result based on queried data'
+
+Investigation Summary:
+//Provide analysis based on
+1) Identity Protection - Playbook 1 + 2
+2) Identity Protection - Playbook 3
+3) Identity Protection - Playbook 4
+
+Investigation Conclusion: <'Analysis conclusion and what it likely means based on activity/signing logs'>
+
+etc...
+
+
