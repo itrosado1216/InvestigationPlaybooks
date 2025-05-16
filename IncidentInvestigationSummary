@@ -1,0 +1,145 @@
+
+
+
+
+
+LLM Instructions:
+
+You will start out with 'Playbook 1: Check Current Incidents'. Based on the results, leverage the proceeding playbooks to investigate the log sources to determine whether the incident requires additional investigation, whether the incident is a False Positive, True Positive. 
+You will run through each playbook per incident found returned from the 'Playbook 1: Check Current Incidents'  
+You will not stop until each incident is properly investigated. 
+Always use the MCP Tool: run_sentinel_query
+You will run through all of the playbook workflows per incident. 
+
+Model Context: 
+#Model Instructions
+
+This would be the output of 1 incident. But you will do this for each incident record found. 
+---- Incident #1 ----
+
+Playbook 1: Incident Information
+let Engineer = 'elvis.rosado@isolved.cloud';
+SecurityIncident
+| where Severity != 'Informational'
+| where Status != 'Resolved'
+| extend IncidentOwner = tostring(Owner.assignedTo)
+| extend IncidentOwnerUPN = tostring(Owner.userPrincipalName)
+| where IncidentOwnerUPN contains (Engineer)
+| mv-expand AlertId = parse_json(AlertIds)
+| project tostring(AlertId)
+| join (SecurityAlert) on$$left.AlertId ==$$right.SystemAlertId
+| extend dynamicEntities = parse_json(Entities)
+| mv-expand dynamicEntities
+| evaluate bag_unpack(dynamicEntities, columnsConflict='replace_source')
+| extend AlertQuery = tostring(parse_json(ExtendedProperties).Query)
+| project TimeGenerated, AlertName, DisplayName, AlertSeverity,Address,Type, Description, AlertQuery
+
+
+TimeGenerated
+AlertName
+Involved Entities
+Incident / Alert Summary
+
+Playbook 2: Historical Incident Information
+-Search historical incidents and see if there's similar information that leads to the incident conclusion. 
+Example: If incident with same exact entities has been resolved before with a false positive, we can conclude that the incident being investigated is a false positive. 
+
+SecurityIncident
+| where TimeGenerated > ago(30d)
+| where Severity != 'Informational'
+| where Status == 'Closed'
+| extend IncidentOwner = tostring(Owner.assignedTo)
+| extend IncidentOwnerUPN = tostring(Owner.userPrincipalName)
+| mv-expand AlertId = parse_json(AlertIds)
+| extend AlertId = tostring(AlertId)  // <-- Cast to string
+| join kind=inner (
+    SecurityAlert
+    | extend AlertId = tostring(SystemAlertId)  // <-- Cast to string
+    | project AlertId, Entities, AlertName, AlertSeverity, Description
+) on AlertId
+| where isnotempty( IncidentOwner ) and isnotempty( ClassificationComment)
+| summarize arg_max(TimeGenerated, *) by IncidentName
+| project 
+    TimeGenerated,
+    IncidentOwner,
+    IncidentOwnerUPN,
+    IncidentName,
+    Title,
+    Severity,
+    Classification,
+    ClassificationComment,
+    ClassificationReason,
+    ProviderIncidentId,
+    AlertIds,
+    AlertName,
+    AlertSeverity
+
+Playbook 3: Entra ID Investigation
+let IPEntity = '<Search IP Entities>';
+SigninLogs
+| where UserPrincipalName has '@'
+| where IPAddress in (IPEntity)
+| extend 
+    Browser = tostring(DeviceDetail.browser),
+    DeviceID = tostring(DeviceDetail.deviceId),
+    DeviceDisplayName = tostring(DeviceDetail.displayName),
+    DeviceIsManaged = tostring(DeviceDetail.isManaged),
+    OperatingSystem = tostring(DeviceDetail.operatingSystem),
+    DeviceTrustType = tostring(DeviceDetail.trustType)
+| summarize arg_max(TimeGenerated, *) by UserPrincipalName, IPAddress, Location, DeviceDisplayName, DeviceIsManaged, Browser, OperatingSystem, DeviceTrustType
+| project TimeGenerated, UserPrincipalName, IPAddress, Location, DeviceDisplayName, DeviceIsManaged, Browser, OperatingSystem, DeviceTrustType
+
+Description: This playbook is used to correlate entities from the Incidents to signing logs to ensure signin activity from the user entities is normal. 
+This query is only used when we need to perform additional investigations on user entities. 
+
+Playbook 3: Palo Alto Network Logs Investigation
+Description:  This Playbook is to be used to perform searches for public IP or Private IP address activity when the investigation is deemed necessary. 
+
+let SourceIPEntities = '<Search for IP Entity>;
+CommonSecurityLog
+| where SourceIP == SourceIPEntities or DestinationIP == SourceIPEntities
+| summarize 
+    FirstSeenTime = min(TimeGenerated),
+    LastSeenTime = max(TimeGenerated),
+    FirstSource = arg_min(TimeGenerated, SourceIP, DestinationIP, DeviceName, DeviceVendor, DeviceProduct, Message),
+    LastSource = arg_max(TimeGenerated, SourceIP, DestinationIP, DeviceName, DeviceVendor, DeviceProduct, Message)
+
+--Playbook 4: Search for IP Addresses in Network Logs (Palo Alto)
+Description:  This Playbook is to be used to perform searches for public IP or Private IP address activity when the investigation is deemed necessary. 
+
+
+Playbook 4: Managed Devices Connecting to Investigated Remote Public IP
+//This query can be used when trying to search if any device managed by Defender has communicated with a //Public IP being investigated
+let PublicIPEntities = '<Search for Public IP Entities>';
+DeviceNetworkEvents
+| where TimeGenerated > ago(7d)
+| where InitiatingProcessAccountName !contains "lenovo" and InitiatingProcessAccountName !contains "network service"
+| where isnotempty( InitiatingProcessAccountUpn) and isnotempty( RemoteUrl)
+| where RemoteIP == PublicIPEntities
+| summarize arg_max(TimeGenerated, *) by DeviceId, InitiatingProcessFolderPath, InitiatingProcessFileName, InitiatingProcessCommandLine, InitiatingProcessAccountUpn
+| project TimeGenerated, InitiatingProcessFolderPath, InitiatingProcessFileName, InitiatingProcessCommandLine, InitiatingProcessAccountUpn, InitiatingProcessVersionInfoProductName, MachineGroup, RemoteIP, LocalIP, RemoteUrl, LocalPort, RemoteIPType, DeviceName
+
+Device Name: <DeviceName>
+User Principal Name: <InitiatingProcessAccountName>
+Summary: Whether an isolved owned device was observed connecting to a public IP address that is being investigated as a result of an incident. 
+
+Playbook 5: Managed Devices Assigned Investigated Private IP Address
+//This query can be used when trying to search if any device managed by Defender has communicated with a //private IP being investigated 
+let LocalIPEntities = '<Search for Local IP Entities>';
+DeviceNetworkEvents
+| where TimeGenerated > ago(7d)
+| where InitiatingProcessAccountName !contains "lenovo" and InitiatingProcessAccountName !contains "network service"
+| where isnotempty( InitiatingProcessAccountUpn) and isnotempty( RemoteUrl)
+| where LocalIP == LocalIPEntities 
+| summarize arg_max(TimeGenerated, *) by DeviceId, DeviceName, InitiatingProcessAccountUpn, LocalIP
+| project TimeGenerated, DeviceName, DeviceId, InitiatingProcessAccountDomain,InitiatingProcessAccountName, LocalIP
+
+DeviceName: <DeviceName>
+User Principal Name: <InitiatingProcessAccountName>
+Summary: Whether private IP entity being investigated as a result of an incident is assigned to a managed device. 
+
+
+---------Incident Analysis Summary:
+Verdict: <'False Positive', 'True Positive', 'Undetermined'
+Confidence in verdict: %Value
+Incident Guidance: Provide any guidance you are able to provide about the investigated incident. 
